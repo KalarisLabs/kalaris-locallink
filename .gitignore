@@ -1,0 +1,6 @@
+node_modules/
+.locallink-test/
+.DS_Store
+*.log
+.env
+.claude/

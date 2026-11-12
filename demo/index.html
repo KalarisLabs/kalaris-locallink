@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocalLink demo chat</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f5f1; --card:#fff; --ink:#1c1b18; --mute:#6b6860; --line:#dedbd2; --accent:#1f6f4a; --warn:#8a5a12; --bubble:#ece9e1; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161614; --card:#201f1c; --ink:#eeece6; --mute:#a09c92; --line:#3a3833; --accent:#3fa675; --warn:#d9a54a; --bubble:#2b2a26; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, sans-serif; }
+  .app { max-width:720px; margin:0 auto; padding:16px; min-height:100vh; display:flex; flex-direction:column; gap:12px; }
+  header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+  h1 { font-size:18px; margin:0; }
+  header span { color:var(--mute); font-size:13px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .bar label { font-size:13px; color:var(--mute); display:flex; flex-direction:column; gap:4px; flex:1; min-width:160px; }
+  select, textarea, button { font:inherit; color:inherit; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:12px; font-size:14px; color:var(--mute); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  #status .dot { width:9px; height:9px; border-radius:50%; background:var(--mute); flex:none; }
+  #status.ok .dot { background:var(--accent); }
+  #status.wait .dot { background:var(--warn); animation:pulse 1s infinite alternate; }
+  #status.bad .dot { background:#b5483a; }
+  @keyframes pulse { to { opacity:.3; } }
+  #status .grow { flex:1; min-width:200px; }
+  .code { font:600 20px ui-monospace, monospace; letter-spacing:2px; color:var(--ink); }
+  code { font:13px ui-monospace, monospace; background:var(--bubble); padding:2px 6px; border-radius:5px; }
+  #log { flex:1; display:flex; flex-direction:column; gap:10px; min-height:240px; overflow:auto; }
+  .msg { max-width:85%; padding:9px 13px; border-radius:14px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .msg.assistant { align-self:flex-start; background:var(--bubble); }
+  .empty { margin:auto; color:var(--mute); text-align:center; font-size:14px; }
+  form { display:flex; gap:8px; }
+  textarea { flex:1; resize:none; height:44px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header><h1>Demo chat</h1><span>a website using the LocalLink protocol</span></header>
+
+  <div class="panel">
+    <div class="bar">
+      <label>Model provider
+        <select id="provider">
+          <option value="cloud">Cloud (not wired up in this demo)</option>
+          <option value="local">Local model on this computer</option>
+        </select>
+      </label>
+      <label>Model
+        <select id="model" disabled><option>—</option></select>
+      </label>
+    </div>
+    <div id="status"><span class="dot"></span><span class="grow" id="statusText">Choose “Local model” to connect to models on your computer.</span><span id="statusActions"></span></div>
+  </div>
+
+  <div class="panel" id="log"><div class="empty">Messages stay between this tab and your computer.</div></div>
+
+  <form id="form">
+    <textarea id="input" placeholder="Connect a local model to start" disabled></textarea>
+    <button class="primary" id="send" disabled>Send</button>
+  </form>
+</div>
+
+<script type="module">
+import { LocalLink } from './locallink.js';
+
+const $ = id => document.getElementById(id);
+const provider = $('provider'), modelSel = $('model'), statusEl = $('status'), statusText = $('statusText'),
+      actions = $('statusActions'), log = $('log'), form = $('form'), input = $('input'), send = $('send');
+
+let link = null;
+let busy = false;
+const history = [];
+
+function setStatus(kind, html, buttons = []) {
+  statusEl.className = kind;
+  statusText.innerHTML = html;
+  actions.replaceChildren(...buttons.map(([label, fn]) => {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.onclick = fn; return b;
+  }));
+}
+
+function setChatEnabled(on) {
+  input.disabled = send.disabled = !on || busy;
+  input.placeholder = on ? 'Message your local model' : 'Connect a local model to start';
+}
+
+function reset(message) {
+  link = null;
+  modelSel.replaceChildren(new Option('—'));
+  modelSel.disabled = true;
+  setChatEnabled(false);
+  if (message) setStatus('', message);
+}
+
+async function showModels() {
+  const models = await link.models();
+  modelSel.replaceChildren(...models.map(m => new Option(m.id, m.id)));
+  modelSel.disabled = !models.length;
+  setChatEnabled(models.length > 0);
+  if (models.length) {
+    setStatus('ok', `Connected. ${models.length} local model${models.length > 1 ? 's' : ''} available.`,
+      [['Refresh', showModels], ['Disconnect', disconnect]]);
+  } else {
+    setStatus('wait', 'Connected, but no models are running. Start Ollama or LM Studio, then refresh.',
+      [['Refresh', showModels], ['Disconnect', disconnect]]);
+  }
+}
+
+async function connect() {
+  setStatus('wait', 'Looking for LocalLink on this computer…');
+  try {
+    link = await LocalLink.connect({
+      appName: 'Demo chat',
+      onCode: code => setStatus('wait', `Approve this site in the LocalLink window that just opened. Check the code matches: <span class="code">${code}</span>`),
+    });
+    await showModels();
+  } catch (e) {
+    reset();
+    const retry = [['Try again', connect]];
+    if (e.code === 'no_bridge') setStatus('bad', 'LocalLink is not running on this computer. Start it with <code>node bridge/locallink-bridge.mjs</code>, then try again.', retry);
+    else if (e.code === 'denied') setStatus('bad', 'You denied access. You can try again in 30 seconds.', retry);
+    else if (e.code === 'expired') setStatus('bad', 'The approval request timed out.', retry);
+    else setStatus('bad', e.message, retry);
+  }
+}
+
+async function disconnect() {
+  try { await link?.disconnect(); } catch {}
+  provider.value = 'cloud';
+  reset('Disconnected. This site no longer has access to your local models.');
+}
+
+provider.onchange = () => provider.value === 'local' ? connect() : reset('Choose “Local model” to connect to models on your computer.');
+
+function bubble(role, text = '') {
+  log.querySelector('.empty')?.remove();
+  const el = document.createElement('div');
+  el.className = `msg ${role}`; el.textContent = text;
+  log.append(el); log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+form.onsubmit = async e => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || !link || busy) return;
+  input.value = '';
+  history.push({ role: 'user', content: text });
+  bubble('user', text);
+  const out = bubble('assistant', '…');
+  busy = true; setChatEnabled(true);
+  let reply = '';
+  try {
+    for await (const chunk of link.chat({ model: modelSel.value, messages: history })) {
+      reply += chunk; out.textContent = reply; log.scrollTop = log.scrollHeight;
+    }
+    history.push({ role: 'assistant', content: reply });
+  } catch (err) {
+    history.pop();
+    out.textContent = `Could not get a reply: ${err.message}`;
+    if (err.code === 'invalid_token') { provider.value = 'cloud'; reset('Access was revoked. Choose “Local model” to connect again.'); }
+  } finally {
+    busy = false; setChatEnabled(!!link); input.focus();
+  }
+};
+
+input.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); } };
+
+// A returning visitor who already approved this site reconnects without a prompt.
+LocalLink.resume().then(async existing => {
+  if (!existing) return;
+  link = existing; provider.value = 'local';
+  await showModels();
+});
+</script>
+</body>
+</html>
